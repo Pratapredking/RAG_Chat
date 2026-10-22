@@ -66,7 +66,7 @@ async function startServer() {
         // Call AI agent with message and existing thread ID (continues conversation)
         const response = await callAgent(client, message, threadId)
         // Send AI response (no need to send threadId again since it's continuing)
-        res.json({ response })
+        res.json({ threadId, response })
       } catch (error) {
         // Log any errors that occur during agent execution
         console.error('Error in chat:', error)

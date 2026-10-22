@@ -107,7 +107,9 @@ const ChatWidget = () => {
       // Add AI response to messages array
       setMessages(prevMessages => [...prevMessages, agentResponse])
       // Update thread ID for future messages in this conversation
-      setThreadId(data.threadId)
+      if (data.threadId) {
+        setThreadId(data.threadId)
+      }
       // Log updated messages for debugging
       console.log(messages)
     } catch (error) {

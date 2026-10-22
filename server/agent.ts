@@ -1,20 +1,19 @@
 // Import required modules from LangChain ecosystem
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai" // For creating vector embeddings from text using Gemini
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai" // Google's Gemini AI model
-import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages" // Message types for conversations
-import {
-  ChatPromptTemplate,      // For creating structured prompts with placeholders
-  MessagesPlaceholder,     // Placeholder for dynamic message history
-} from "@langchain/core/prompts"
-import { StateGraph } from "@langchain/langgraph"              // State-based workflow orchestration
-import { Annotation } from "@langchain/langgraph"              // Type annotations for state management
-import { tool } from "@langchain/core/tools"                   // For creating custom tools/functions
-import { ToolNode } from "@langchain/langgraph/prebuilt"       // Pre-built node for executing tools
+import { HumanMessage, SystemMessage } from "@langchain/core/messages" // Message types for conversations
+import { DynamicStructuredTool } from "@langchain/core/tools" // For creating custom tools/functions
+import type { JSONSchema } from "@langchain/core/utils/json_schema"
+import { GeminiEmbeddings } from "./gemini-embeddings"
+import { createReactAgent } from "@langchain/langgraph/prebuilt" // Pre-built tool-calling agent workflow
 import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb" // For saving conversation state
 import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"   // Vector search integration with MongoDB
 import { MongoClient } from "mongodb"                          // MongoDB database client
-import { z } from "zod"                                        // Schema validation library
 import "dotenv/config"                                         // Load environment variables from .env file
+
+type ItemLookupInput = {
+  query: string
+  n?: number
+}
 
 // Utility function to handle API rate limits with exponential backoff
 async function retryWithBackoff<T>(
@@ -26,11 +25,20 @@ async function retryWithBackoff<T>(
     try {
       return await fn()    // Try to execute the function
     } catch (error: any) {
-      // Check if it's a rate limit error (HTTP 429) and we have retries left
-      if (error.status === 429 && attempt < maxRetries) {
+      const status = error.status ?? error.response?.status
+      const networkCode = error.code ?? error.cause?.code
+      const isTransient = status === 429
+        || status >= 500
+        || error.name === "TypeError"
+        || error.name === "AbortError"
+        || error.message?.includes("fetch failed")
+        || ["ABORT_ERR", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT"].includes(networkCode)
+
+      // Retry rate limits and temporary provider/network failures.
+      if (isTransient && attempt < maxRetries) {
         // Calculate exponential backoff delay: 2^attempt seconds, max 30 seconds
         const delay = Math.min(1000 * Math.pow(2, attempt), 30000)
-        console.log(`Rate limit hit. Retrying in ${delay/1000} seconds...`)
+        console.log(`Temporary AI service error. Retrying in ${delay/1000} seconds...`)
         // Wait for the calculated delay before retrying
         await new Promise(resolve => setTimeout(resolve, delay))
         continue // Go to next iteration (retry)
@@ -49,18 +57,32 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
     const db = client.db(dbName)              // Get database instance
     const collection = db.collection("items") // Get the 'items' collection
 
-    // Define the state structure for the agent workflow
-    const GraphState = Annotation.Root({
-      messages: Annotation<BaseMessage[]>({
-        // Reducer function: how to combine old and new messages
-        reducer: (x, y) => x.concat(y), // Simply concatenate old messages (x) with new messages (y)
-      }),
-    })
-
     // Create a custom tool for searching furniture inventory
-    const itemLookupTool = tool(
+    const itemLookupSchema: JSONSchema = {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "The search query",
+        },
+        n: {
+          type: "number",
+          default: 10,
+          description: "Number of results to return",
+        },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    }
+
+    const itemLookupTool = new DynamicStructuredTool<
+      JSONSchema,
+      ItemLookupInput,
+      ItemLookupInput,
+      string
+    >({
       // The actual function that will be executed when tool is called
-      async ({ query, n = 10 }) => {
+      func: async ({ query, n = 10 }) => {
         try {
           console.log("Item lookup tool called with query:", query)
 
@@ -79,7 +101,9 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
           }
 
           // Get sample documents for debugging purposes
-          const sampleDocs = await collection.find({}).limit(3).toArray()
+          const sampleDocs = await collection.find({}, {
+            projection: { item_id: 1, item_name: 1 },
+          }).limit(3).toArray()
           console.log("Sample documents:", sampleDocs)
 
           // Configuration for MongoDB Atlas Vector Search
@@ -90,49 +114,79 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
             embeddingKey: "embedding",       // Field containing the vector embeddings
           }
 
-          // Create vector store instance for semantic search using Google Gemini embeddings
-          const vectorStore = new MongoDBAtlasVectorSearch(
-            new GoogleGenerativeAIEmbeddings({
-              apiKey: process.env.GOOGLE_API_KEY, // Google API key from environment
-              model: "text-embedding-004",         // Gemini embedding model
-            }),
-            dbConfig
-          )
+          try {
+            // Create vector store instance for semantic search using Gemini embeddings
+            const vectorStore = new MongoDBAtlasVectorSearch(
+              new GeminiEmbeddings({
+                apiKey: process.env.GOOGLE_API_KEY,
+              }),
+              dbConfig
+            )
 
-          console.log("Performing vector search...")
-          // Perform semantic search using vector embeddings
-          const result = await vectorStore.similaritySearchWithScore(query, n)
-          console.log(`Vector search returned ${result.length} results`)
-          
-          // If vector search returns no results, fall back to text search
-          if (result.length === 0) {
-            console.log("Vector search returned no results, trying text search...")
-            // MongoDB text search using regular expressions
-            const textResults = await collection.find({
-              $or: [ // OR condition - match any of these fields
-                { item_name: { $regex: query, $options: 'i' } },        // Case-insensitive search in item name
-                { item_description: { $regex: query, $options: 'i' } }, // Case-insensitive search in description
-                { categories: { $regex: query, $options: 'i' } },       // Case-insensitive search in categories
-                { embedding_text: { $regex: query, $options: 'i' } }    // Case-insensitive search in embedding text
-              ]
-            }).limit(n).toArray() // Limit results and convert to array
-            
-            console.log(`Text search returned ${textResults.length} results`)
-            // Return text search results as JSON string
-            return JSON.stringify({
-              results: textResults,
-              searchType: "text",    // Indicate this was a text search
-              query: query,
-              count: textResults.length
-            })
+            console.log("Performing vector search...")
+            const result = await vectorStore.similaritySearchWithScore(query, n)
+            console.log(`Vector search returned ${result.length} results`)
+
+            if (result.length > 0) {
+              return JSON.stringify({
+                results: result,
+                searchType: "vector",
+                query,
+                count: result.length,
+              })
+            }
+          } catch (vectorError: any) {
+            // Existing databases may still contain vectors from the retired
+            // text-embedding-004 model. Keep inventory usable until reseeded.
+            console.warn("Vector search failed; falling back to text search:", vectorError.message)
           }
 
-          // Return vector search results as JSON string
+          console.log("Trying text search...")
+          const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          let textResults = await collection.find({
+            $or: [
+              { item_name: { $regex: escapedQuery, $options: "i" } },
+              { item_description: { $regex: escapedQuery, $options: "i" } },
+              { categories: { $regex: escapedQuery, $options: "i" } },
+              { embedding_text: { $regex: escapedQuery, $options: "i" } },
+            ],
+          }).limit(n).toArray()
+
+          // Natural-language tool queries often contain plural forms (for
+          // example "dining tables") while inventory names are singular.
+          // If the exact phrase misses, require every meaningful token and
+          // allow an optional trailing "s" for a small, predictable fallback.
+          if (textResults.length === 0) {
+            const tokens = query.toLowerCase().match(/[a-z0-9]+/g)
+              ?.filter((token) => token.length > 2)
+              .map((token) => token.endsWith("s") ? token.slice(0, -1) : token)
+              .filter((token, index, all) => all.indexOf(token) === index)
+              ?? []
+
+            if (tokens.length > 0) {
+              textResults = await collection.find({
+                $and: tokens.map((token) => {
+                  const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+                  const tokenPattern = `${escapedToken}s?`
+                  return {
+                    $or: [
+                      { item_name: { $regex: tokenPattern, $options: "i" } },
+                      { item_description: { $regex: tokenPattern, $options: "i" } },
+                      { categories: { $regex: tokenPattern, $options: "i" } },
+                      { embedding_text: { $regex: tokenPattern, $options: "i" } },
+                    ],
+                  }
+                }),
+              }).limit(n).toArray()
+            }
+          }
+
+          console.log(`Text search returned ${textResults.length} results`)
           return JSON.stringify({
-            results: result,
-            searchType: "vector",   // Indicate this was a vector search
-            query: query,
-            count: result.length
+            results: textResults,
+            searchType: "text",
+            query,
+            count: textResults.length,
           })
           
         } catch (error: any) {
@@ -152,51 +206,32 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
           })
         }
       },
-      // Tool metadata and schema definition
-      {
-        name: "item_lookup",                                    // Tool name that the AI will reference
-        description: "Gathers furniture item details from the Inventory database", // Description for the AI
-        schema: z.object({                                      // Input validation schema
-          query: z.string().describe("The search query"),      // Required string parameter
-          n: z.number().optional().default(10)                 // Optional number parameter with default
-            .describe("Number of results to return"),
-        }),
-      }
-    )
+      name: "item_lookup",                                    // Tool name that the AI will reference
+      description: "Gathers furniture item details from the Inventory database", // Description for the AI
+      schema: itemLookupSchema,
+    })
 
     // Array of all available tools (just one in this case)
     const tools = [itemLookupTool]
-    // Create a tool execution node for the workflow
-    const toolNode = new ToolNode<typeof GraphState.State>(tools)
-
     // Initialize the AI model (Google's Gemini)
     const model = new ChatGoogleGenerativeAI({
-      model: "gemini-1.5-flash",         //  Use Gemini 1.5 Flash model
+      model: process.env.GEMINI_CHAT_MODEL || "gemini-2.5-flash",
       temperature: 0,                    // Deterministic responses (no randomness)
       maxRetries: 0,                     // Disable built-in retries (we handle our own)
       apiKey: process.env.GOOGLE_API_KEY, // Google API key from environment
-    }).bindTools(tools)                  // Bind our custom tools to the model
+    })
 
-    // Decision function: determines next step in the workflow
-    function shouldContinue(state: typeof GraphState.State) {
-      const messages = state.messages                               // Get all messages
-      const lastMessage = messages[messages.length - 1] as AIMessage // Get the most recent message
-
-      // If the AI wants to use tools, go to tools node; otherwise end
-      if (lastMessage.tool_calls?.length) {
-        return "tools"  // Route to tool execution
-      }
-      return "__end__"  // End the workflow
-    }
-
-    // Function that calls the AI model with retry logic
-    async function callModel(state: typeof GraphState.State) {
-      return retryWithBackoff(async () => { // Wrap in retry logic
-        // Create a structured prompt template
-        const prompt = ChatPromptTemplate.fromMessages([
-          [
-            "system", // System message defines the AI's role and behavior
-            `You are a helpful E-commerce Chatbot Agent for a furniture store. 
+    // Initialize conversation state persistence
+    const checkpointer = new MongoDBSaver({ client, dbName })
+    // Build the standard tool-calling workflow with state saving. Using the
+    // prebuilt agent avoids TypeScript's excessively-deep generic inference in
+    // a manually assembled StateGraph while keeping the same runtime behavior.
+    const app = createReactAgent({
+      llm: model,
+      tools,
+      checkpointSaver: checkpointer,
+      prompt: (state) => [
+        new SystemMessage(`You are a helpful E-commerce Chatbot Agent for a furniture store.
 
 IMPORTANT: You have access to an item_lookup tool that searches the furniture inventory database. ALWAYS use this tool when customers ask about furniture items, even if the tool returns errors or empty results.
 
@@ -205,47 +240,22 @@ When using the item_lookup tool:
 - If it returns an error or no results, acknowledge this and offer to help in other ways
 - If the database appears to be empty, let the customer know that inventory might be being updated
 
-Current time: {time}`,
-          ],
-          new MessagesPlaceholder("messages"), // Placeholder for conversation history
-        ])
-
-        // Fill in the prompt template with actual values
-        const formattedPrompt = await prompt.formatMessages({
-          time: new Date().toISOString(), // Current timestamp
-          messages: state.messages,       // All previous messages
-        })
-
-        // Call the AI model with the formatted prompt
-        const result = await model.invoke(formattedPrompt)
-        // Return new state with the AI's response added
-        return { messages: [result] }
-      })
-    }
-
-    // Build the workflow graph
-    const workflow = new StateGraph(GraphState)
-      .addNode("agent", callModel)                    // Add AI model node
-      .addNode("tools", toolNode)                     // Add tool execution node
-      .addEdge("__start__", "agent")                  // Start workflow at agent
-      .addConditionalEdges("agent", shouldContinue)   // Agent decides: tools or end
-      .addEdge("tools", "agent")                      // After tools, go back to agent
-
-    // Initialize conversation state persistence
-    const checkpointer = new MongoDBSaver({ client, dbName })
-    // Compile the workflow with state saving
-    const app = workflow.compile({ checkpointer })
+Current time: ${new Date().toISOString()}`),
+        ...state.messages,
+      ],
+    })
 
     // Execute the workflow
-    const finalState = await app.invoke(
+    const finalState = await retryWithBackoff(() => app.invoke(
       {
         messages: [new HumanMessage(query)], // Start with user's question
       },
-      { 
-        recursionLimit: 15,                   // Prevent infinite loops
-        configurable: { thread_id: thread_id } // Conversation thread identifier
+      {
+        recursionLimit: 15,                    // Prevent infinite loops
+        configurable: { thread_id: thread_id }, // Conversation thread identifier
+        signal: AbortSignal.timeout(20_000),    // Bound stalled provider requests
       }
-    )
+    ))
 
     // Extract the final response from the conversation
     const response = finalState.messages[finalState.messages.length - 1].content

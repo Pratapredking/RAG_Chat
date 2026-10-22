@@ -4,7 +4,8 @@
     "main": "index.js",
     "scripts": {
         "dev": "npx ts-node index.ts",
-        "seed": "npx ts-node seed-database.ts"
+        "seed": "npx ts-node seed-database.ts",
+        "migrate:embeddings": "npx ts-node migrate-embeddings.ts"
     },
     "keywords": [],
     "author": "",

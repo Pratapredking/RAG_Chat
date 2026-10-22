@@ -1,5 +1,5 @@
 // Import Google's Gemini chat model and embeddings for AI text generation and vector creation
-import { ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai"
 // Import structured output parser to ensure AI returns data in specific format
 import { StructuredOutputParser } from "@langchain/core/output_parsers"
 // Import MongoDB client for database connection
@@ -10,13 +10,14 @@ import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"
 import { z } from "zod"
 // Load environment variables from .env file (API keys, connection strings)
 import "dotenv/config"
+import { GeminiEmbeddings } from "./gemini-embeddings"
 
 // Create MongoDB client instance using connection string from environment variables
 const client = new MongoClient(process.env.MONGODB_ATLAS_URI as string)
 
 // Initialize Google Gemini chat model for generating synthetic furniture data
 const llm = new ChatGoogleGenerativeAI({
-  model: "gemini-1.5-flash",  // Use Gemini 1.5 Flash model
+  model: process.env.GEMINI_CHAT_MODEL || "gemini-2.5-flash",
   temperature: 0.7,               // Set creativity level (0.7 = moderately creative)
   apiKey: process.env.GOOGLE_API_KEY, // Google API key from environment variables
 })
@@ -188,9 +189,8 @@ async function seedDatabase(): Promise<void> {
       // Create vector embeddings and store in MongoDB Atlas using Gemini
       await MongoDBAtlasVectorSearch.fromDocuments(
         [record],                    // Array containing single record
-        new GoogleGenerativeAIEmbeddings({            // Google embedding model
-          apiKey: process.env.GOOGLE_API_KEY,         // Google API key
-          modelName: "text-embedding-004",            // Google's standard embedding model (768 dimensions)
+        new GeminiEmbeddings({                         // Google embedding model
+          apiKey: process.env.GOOGLE_API_KEY,
         }),
         {
           collection,                // MongoDB collection reference
