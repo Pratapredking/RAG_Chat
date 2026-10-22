@@ -5,7 +5,8 @@
     "scripts": {
         "dev": "npx ts-node index.ts",
         "seed": "npx ts-node seed-database.ts",
-        "migrate:embeddings": "npx ts-node migrate-embeddings.ts"
+        "migrate:embeddings": "npx ts-node migrate-embeddings.ts",
+        "ingest:pdf": "npx ts-node ingest-pdf.ts"
     },
     "keywords": [],
     "author": "",
@@ -23,6 +24,7 @@
         "express": "^4.19.2",
         "langchain": "^0.2.17",
         "mongodb": "^6.8.0",
+        "pdf-parse": "1.1.1",
         "zod": "^3.23.8"
     },
     "devDependencies": {

@@ -11,6 +11,44 @@
 
 </div>
 
+---
+
+## PDF RAG ingestion
+
+The backend can extract text from PDFs, split it into page-aware chunks, create
+768-dimensional Gemini embeddings, store them in MongoDB Atlas, and verify that
+the document is searchable.
+
+From the `server` directory, install dependencies and ingest a PDF:
+
+```powershell
+npm install
+npm run ingest:pdf -- "./uploads/manual.pdf" --query "What is the warranty period?"
+```
+
+The ingestion command automatically:
+
+- validates the PDF signature and file-size limit;
+- hashes the source file to create an idempotent document ID;
+- skips and reports pages that require OCR;
+- stores chunks in the `pdf_chunks` collection;
+- creates the `pdf_vector_index` Atlas vector-search index when needed;
+- verifies retrieval and prints filename/page citations for the top matches.
+
+Uploaded files under `server/uploads/` are ignored by Git. For a fully scanned
+or image-only PDF, run OCR first and ingest the searchable PDF produced by the
+OCR tool.
+
+After ingestion, start the server normally:
+
+```powershell
+npm run dev
+```
+
+The chat agent uses `pdf_search` for questions about indexed manuals, policies,
+catalogs, and other PDF documents. It continues to use `item_lookup` for
+furniture inventory questions.
+
 ## 🎯 What We're Building
 
 In this tutorial, we'll create a sophisticated **AI Agent** using an **agentic approach** - not just a chatbot that responds, but an intelligent system that autonomously:
@@ -98,7 +136,18 @@ GOOGLE_API_KEY=your_google_api_key_here
 
 # 🗄️ Database
 MONGODB_ATLAS_URI=your_mongodb_atlas_uri_here
+
+# Optional: ordered Gemini chat model failover
+GEMINI_CHAT_MODEL=gemini-2.5-flash
+GEMINI_FALLBACK_MODELS=gemini-3.8-flash,gemini-3.5-flash-lite
+GEMINI_MODEL_TIMEOUT_MS=15000
 ```
+
+If the primary Gemini model has a transient network, timeout, rate-limit, or
+provider error, the server automatically tries each fallback in order. Set
+`GEMINI_FALLBACK_MODELS` to a comma-separated list to change the order. Invalid
+API credentials are not retried against other models because they use the same
+Google API key.
 
 ### 🌱 **Step 3: Seed the Database**
 

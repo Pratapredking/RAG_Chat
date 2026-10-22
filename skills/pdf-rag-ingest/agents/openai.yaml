@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF RAG Ingest"
+  short_description: "Ingest PDFs into a searchable vector store"
+  default_prompt: "Use $pdf-rag-ingest to ingest this PDF into the project RAG store and verify retrieval."

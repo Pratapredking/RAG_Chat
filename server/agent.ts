@@ -1,5 +1,4 @@
 // Import required modules from LangChain ecosystem
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai" // Google's Gemini AI model
 import { HumanMessage, SystemMessage } from "@langchain/core/messages" // Message types for conversations
 import { DynamicStructuredTool } from "@langchain/core/tools" // For creating custom tools/functions
 import type { JSONSchema } from "@langchain/core/utils/json_schema"
@@ -8,10 +7,21 @@ import { createReactAgent } from "@langchain/langgraph/prebuilt" // Pre-built to
 import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb" // For saving conversation state
 import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"   // Vector search integration with MongoDB
 import { MongoClient } from "mongodb"                          // MongoDB database client
+import { PDF_COLLECTION_NAME, searchPdfChunks } from "./pdf-rag"
+import {
+  FallbackChatGoogleGenerativeAI,
+  getGeminiChatModelNames,
+} from "./fallback-chat-model"
 import "dotenv/config"                                         // Load environment variables from .env file
 
 type ItemLookupInput = {
   query: string
+  n?: number
+}
+
+type PdfSearchInput = {
+  query: string
+  document_id?: string
   n?: number
 }
 
@@ -211,15 +221,82 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
       schema: itemLookupSchema,
     })
 
-    // Array of all available tools (just one in this case)
-    const tools = [itemLookupTool]
-    // Initialize the AI model (Google's Gemini)
-    const model = new ChatGoogleGenerativeAI({
-      model: process.env.GEMINI_CHAT_MODEL || "gemini-2.5-flash",
+    const pdfSearchSchema: JSONSchema = {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Question or concept to search for in the indexed PDFs",
+        },
+        document_id: {
+          type: "string",
+          description: "Optional document ID used to restrict search to one PDF",
+        },
+        n: {
+          type: "number",
+          default: 5,
+          description: "Number of PDF chunks to return",
+        },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    }
+
+    const pdfSearchTool = new DynamicStructuredTool<
+      JSONSchema,
+      PdfSearchInput,
+      PdfSearchInput,
+      string
+    >({
+      name: "pdf_search",
+      description: "Searches indexed PDF documents and returns relevant text with filename and page citations",
+      schema: pdfSearchSchema,
+      func: async ({ query, document_id, n = 5 }) => {
+        try {
+          const pdfCount = await db.collection(PDF_COLLECTION_NAME).countDocuments()
+          if (pdfCount === 0) {
+            return JSON.stringify({
+              query,
+              count: 0,
+              message: "No PDF documents have been indexed yet",
+            })
+          }
+
+          const results = await searchPdfChunks(client, query, {
+            documentId: document_id,
+            limit: n,
+          })
+
+          return JSON.stringify({
+            query,
+            document_id,
+            count: results.length,
+            results,
+          })
+        } catch (error: any) {
+          console.error("PDF search failed:", error)
+          return JSON.stringify({
+            query,
+            error: "Failed to search indexed PDFs",
+            details: error.message,
+          })
+        }
+      },
+    })
+
+    const tools = [itemLookupTool, pdfSearchTool]
+    // Initialize Gemini with ordered fallbacks. The wrapper remains a normal
+    // LangChain chat model, so createReactAgent can bind both search tools once
+    // and use the same fallback order at every reasoning step.
+    const [primaryModel, ...fallbackModels] = getGeminiChatModelNames()
+    const model = new FallbackChatGoogleGenerativeAI({
+      model: primaryModel,
+      fallbackModels,
       temperature: 0,                    // Deterministic responses (no randomness)
       maxRetries: 0,                     // Disable built-in retries (we handle our own)
       apiKey: process.env.GOOGLE_API_KEY, // Google API key from environment
     })
+    console.log(`Gemini chat model order: ${model.modelNames.join(" -> ")}`)
 
     // Initialize conversation state persistence
     const checkpointer = new MongoDBSaver({ client, dbName })
@@ -233,12 +310,19 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
       prompt: (state) => [
         new SystemMessage(`You are a helpful E-commerce Chatbot Agent for a furniture store.
 
-IMPORTANT: You have access to an item_lookup tool that searches the furniture inventory database. ALWAYS use this tool when customers ask about furniture items, even if the tool returns errors or empty results.
+IMPORTANT: You have access to two search tools:
+- item_lookup searches the furniture inventory. Always use it for furniture and product questions.
+- pdf_search searches indexed PDF documents. Always use it for manuals, policies, catalogs, uploaded documents, or when the customer asks what a document says.
 
 When using the item_lookup tool:
 - If it returns results, provide helpful details about the furniture items
 - If it returns an error or no results, acknowledge this and offer to help in other ways
 - If the database appears to be empty, let the customer know that inventory might be being updated
+
+When using pdf_search:
+- Base document answers only on retrieved PDF text
+- Cite the filename and page number for each factual claim
+- If no relevant text is returned, say the indexed documents do not contain enough information
 
 Current time: ${new Date().toISOString()}`),
         ...state.messages,
@@ -253,7 +337,7 @@ Current time: ${new Date().toISOString()}`),
       {
         recursionLimit: 15,                    // Prevent infinite loops
         configurable: { thread_id: thread_id }, // Conversation thread identifier
-        signal: AbortSignal.timeout(20_000),    // Bound stalled provider requests
+        signal: AbortSignal.timeout(60_000),    // Allow per-model fallback within an overall bound
       }
     ))
 

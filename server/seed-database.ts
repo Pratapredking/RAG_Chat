@@ -54,7 +54,13 @@ const itemSchema = z.object({
 type Item = z.infer<typeof itemSchema>
 
 // Create parser that ensures AI output matches our item schema
-const parser = StructuredOutputParser.fromZodSchema(z.array(itemSchema))
+type ItemParser = {
+  getFormatInstructions(): string
+  parse(text: string): Promise<Item[]>
+}
+const createItemParser = StructuredOutputParser.fromZodSchema as unknown as
+  (schema: unknown) => ItemParser
+const parser = createItemParser(z.array(itemSchema))
 
 // Function to create database and collection before seeding
 async function setupDatabaseAndCollection(): Promise<void> {
