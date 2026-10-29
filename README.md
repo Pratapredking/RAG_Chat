@@ -32,8 +32,8 @@ The ingestion command automatically:
 - hashes the source file to create an idempotent document ID;
 - skips and reports pages that require OCR;
 - stores chunks in the `pdf_chunks` collection;
-- creates the `pdf_vector_index` Atlas vector-search index when needed;
-- verifies retrieval and prints filename/page citations for the top matches.
+- creates the `pdf_vector_index` and `pdf_text_index` Atlas Search indexes when needed;
+- verifies hybrid retrieval and prints filename/page citations for the top matches.
 
 Uploaded files under `server/uploads/` are ignored by Git. For a fully scanned
 or image-only PDF, run OCR first and ingest the searchable PDF produced by the
@@ -260,8 +260,8 @@ graph TD
 <td width="33%">
 
 ### 🔍 **Advanced Search**
-- Vector semantic search
-- Text fallback search
+- Hybrid vector + Atlas full-text search
+- Reciprocal Rank Fusion (RRF)
 - Real-time inventory lookup
 
 </td>

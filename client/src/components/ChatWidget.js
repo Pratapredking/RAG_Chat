@@ -3,6 +3,17 @@ import React, { useState, useEffect, useRef } from 'react'
 // Import Font Awesome icons for the chat interface
 import { FaRobot, FaPaperPlane, FaTimes, FaCommentDots } from 'react-icons/fa'
 
+// Render simple Markdown bold markers without injecting HTML.
+const renderMessageText = (text) => {
+  return String(text).split(/(\*\*[^*]+\*\*)/g).map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>
+    }
+
+    return part
+  })
+}
+
 // Main chat widget component
 const ChatWidget = () => {
   // State to track if chat window is open or closed
@@ -148,7 +159,7 @@ const ChatWidget = () => {
                 {/* Message bubble with conditional CSS class for styling */}
                 <div className={`message ${message.isAgent ? 'message-bot' : 'message-user'}`}>
                   {/* Display message text */}
-                  {message.text}
+                  {message.isAgent ? renderMessageText(message.text) : message.text}
                 </div>
               </div>
             ))}

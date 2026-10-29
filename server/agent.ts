@@ -2,12 +2,11 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages" // Message types for conversations
 import { DynamicStructuredTool } from "@langchain/core/tools" // For creating custom tools/functions
 import type { JSONSchema } from "@langchain/core/utils/json_schema"
-import { GeminiEmbeddings } from "./gemini-embeddings"
 import { createReactAgent } from "@langchain/langgraph/prebuilt" // Pre-built tool-calling agent workflow
 import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb" // For saving conversation state
-import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"   // Vector search integration with MongoDB
 import { MongoClient } from "mongodb"                          // MongoDB database client
 import { PDF_COLLECTION_NAME, searchPdfChunks } from "./pdf-rag"
+import { searchInventoryItems } from "./inventory-search"
 import {
   FallbackChatGoogleGenerativeAI,
   getGeminiChatModelNames,
@@ -23,6 +22,30 @@ type PdfSearchInput = {
   query: string
   document_id?: string
   n?: number
+}
+
+type PdfCitation = {
+  fileName: string
+  pageNumber: number
+}
+
+function appendPdfCitations(response: string, citations: PdfCitation[]): string {
+  if (citations.length === 0 || /\*\*Source:[\s\S]*?Page:\s*\d+\*\*/i.test(response)) {
+    return response
+  }
+
+  const uniqueCitations = Array.from(new Map(
+    citations.map((citation) => [
+      `${citation.fileName}\u0000${citation.pageNumber}`,
+      citation,
+    ])
+  ).values())
+
+  const sourceLines = uniqueCitations
+    .map(({ fileName, pageNumber }) => `**Source: ${fileName} - Page: ${pageNumber}**`)
+    .join("\n")
+
+  return `${response.trim()}\n\n${sourceLines}`
 }
 
 // Utility function to handle API rate limits with exponential backoff
@@ -66,6 +89,7 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
     const dbName = "inventory_database"        // Name of the MongoDB database
     const db = client.db(dbName)              // Get database instance
     const collection = db.collection("items") // Get the 'items' collection
+    const pdfCitations: PdfCitation[] = []
 
     // Create a custom tool for searching furniture inventory
     const itemLookupSchema: JSONSchema = {
@@ -110,93 +134,13 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
             })
           }
 
-          // Get sample documents for debugging purposes
-          const sampleDocs = await collection.find({}, {
-            projection: { item_id: 1, item_name: 1 },
-          }).limit(3).toArray()
-          console.log("Sample documents:", sampleDocs)
-
-          // Configuration for MongoDB Atlas Vector Search
-          const dbConfig = {
-            collection: collection,           // MongoDB collection to search
-            indexName: "vector_index",       // Name of the vector search index
-            textKey: "embedding_text",       // Field containing the text used for embeddings
-            embeddingKey: "embedding",       // Field containing the vector embeddings
-          }
-
-          try {
-            // Create vector store instance for semantic search using Gemini embeddings
-            const vectorStore = new MongoDBAtlasVectorSearch(
-              new GeminiEmbeddings({
-                apiKey: process.env.GOOGLE_API_KEY,
-              }),
-              dbConfig
-            )
-
-            console.log("Performing vector search...")
-            const result = await vectorStore.similaritySearchWithScore(query, n)
-            console.log(`Vector search returned ${result.length} results`)
-
-            if (result.length > 0) {
-              return JSON.stringify({
-                results: result,
-                searchType: "vector",
-                query,
-                count: result.length,
-              })
-            }
-          } catch (vectorError: any) {
-            // Existing databases may still contain vectors from the retired
-            // text-embedding-004 model. Keep inventory usable until reseeded.
-            console.warn("Vector search failed; falling back to text search:", vectorError.message)
-          }
-
-          console.log("Trying text search...")
-          const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-          let textResults = await collection.find({
-            $or: [
-              { item_name: { $regex: escapedQuery, $options: "i" } },
-              { item_description: { $regex: escapedQuery, $options: "i" } },
-              { categories: { $regex: escapedQuery, $options: "i" } },
-              { embedding_text: { $regex: escapedQuery, $options: "i" } },
-            ],
-          }).limit(n).toArray()
-
-          // Natural-language tool queries often contain plural forms (for
-          // example "dining tables") while inventory names are singular.
-          // If the exact phrase misses, require every meaningful token and
-          // allow an optional trailing "s" for a small, predictable fallback.
-          if (textResults.length === 0) {
-            const tokens = query.toLowerCase().match(/[a-z0-9]+/g)
-              ?.filter((token) => token.length > 2)
-              .map((token) => token.endsWith("s") ? token.slice(0, -1) : token)
-              .filter((token, index, all) => all.indexOf(token) === index)
-              ?? []
-
-            if (tokens.length > 0) {
-              textResults = await collection.find({
-                $and: tokens.map((token) => {
-                  const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-                  const tokenPattern = `${escapedToken}s?`
-                  return {
-                    $or: [
-                      { item_name: { $regex: tokenPattern, $options: "i" } },
-                      { item_description: { $regex: tokenPattern, $options: "i" } },
-                      { categories: { $regex: tokenPattern, $options: "i" } },
-                      { embedding_text: { $regex: tokenPattern, $options: "i" } },
-                    ],
-                  }
-                }),
-              }).limit(n).toArray()
-            }
-          }
-
-          console.log(`Text search returned ${textResults.length} results`)
+          const results = await searchInventoryItems(collection, query, n)
+          console.log(`Hybrid search returned ${results.length} results`)
           return JSON.stringify({
-            results: textResults,
-            searchType: "text",
+            results,
+            searchType: "hybrid",
             query,
-            count: textResults.length,
+            count: results.length,
           })
           
         } catch (error: any) {
@@ -267,9 +211,19 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
             limit: n,
           })
 
+          for (const result of results) {
+            if (Number.isInteger(result.page_number) && (result.page_number as number) > 0) {
+              pdfCitations.push({
+                fileName: result.file_name,
+                pageNumber: result.page_number as number,
+              })
+            }
+          }
+
           return JSON.stringify({
             query,
             document_id,
+            searchType: "hybrid",
             count: results.length,
             results,
           })
@@ -311,8 +265,9 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
         new SystemMessage(`You are a helpful E-commerce Chatbot Agent for a furniture store.
 
 IMPORTANT: You have access to two search tools:
-- item_lookup searches the furniture inventory. Always use it for furniture and product questions.
-- pdf_search searches indexed PDF documents. Always use it for manuals, policies, catalogs, uploaded documents, or when the customer asks what a document says.
+- item_lookup searches the furniture inventory. Use it for prices, availability, reviews, comparisons, recommendations, and general product discovery.
+- pdf_search searches indexed PDF documents and provides filename/page citations. Use it for product features, specifications, included parts or hardware, assembly, safety, care, warranty, manuals, policies, catalogs, uploaded documents, or when the customer asks what a document says.
+- When a question needs both inventory data and documented product details, use both tools.
 
 When using the item_lookup tool:
 - If it returns results, provide helpful details about the furniture items
@@ -322,6 +277,7 @@ When using the item_lookup tool:
 When using pdf_search:
 - Base document answers only on retrieved PDF text
 - Cite the filename and page number for each factual claim
+- Put each citation on its own line and bold the entire source and page reference using exactly this format: **Source: <filename> - Page: <page number>**
 - If no relevant text is returned, say the indexed documents do not contain enough information
 
 Current time: ${new Date().toISOString()}`),
@@ -342,7 +298,10 @@ Current time: ${new Date().toISOString()}`),
     ))
 
     // Extract the final response from the conversation
-    const response = finalState.messages[finalState.messages.length - 1].content
+    const responseContent = finalState.messages[finalState.messages.length - 1].content
+    const response = typeof responseContent === "string"
+      ? appendPdfCitations(responseContent, pdfCitations)
+      : responseContent
     console.log("Agent response:", response)
 
     return response // Return the AI's final response

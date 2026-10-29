@@ -5,6 +5,7 @@ import path from "path"
 import { MongoClient } from "mongodb"
 import { RecursiveCharacterTextSplitter } from "langchain/text_splitter"
 import { GeminiEmbeddings } from "./gemini-embeddings"
+import { reciprocalRankFusion, RankedSearchResult } from "./hybrid-search"
 
 const pdfParse: (
   data: Buffer,
@@ -13,6 +14,7 @@ const pdfParse: (
 
 export const PDF_COLLECTION_NAME = "pdf_chunks"
 export const PDF_VECTOR_INDEX_NAME = "pdf_vector_index"
+export const PDF_TEXT_INDEX_NAME = "pdf_text_index"
 
 const DATABASE_NAME = "inventory_database"
 const EMBEDDING_DIMENSIONS = 768
@@ -41,6 +43,13 @@ export type PdfSearchResult = {
   chunk_index: number
   text: string
   score: number
+  matched_by: string[]
+  source_scores: Record<string, number>
+}
+
+type PdfSearchCandidate = Omit<PdfSearchResult, "score" | "matched_by" | "source_scores"> & {
+  vector_score?: number
+  text_score?: number
 }
 
 export type PdfIngestionResult = {
@@ -221,32 +230,50 @@ export async function ensurePdfIndexes(client: MongoClient): Promise<boolean> {
     { unique: true, name: "pdf_document_chunk_unique" }
   )
 
-  const indexes = await collection
-    .listSearchIndexes(PDF_VECTOR_INDEX_NAME)
-    .toArray()
+  const indexes = await collection.listSearchIndexes().toArray() as Array<{ name?: string }>
+  const existingNames = new Set(indexes.map((index) => index.name))
+  let created = false
 
-  if (indexes.length > 0) return false
+  if (!existingNames.has(PDF_VECTOR_INDEX_NAME)) {
+    await collection.createSearchIndex({
+      name: PDF_VECTOR_INDEX_NAME,
+      type: "vectorSearch",
+      definition: {
+        fields: [
+          {
+            type: "vector",
+            path: "embedding",
+            numDimensions: EMBEDDING_DIMENSIONS,
+            similarity: "cosine",
+          },
+          {
+            type: "filter",
+            path: "document_id",
+          },
+        ],
+      },
+    })
+    created = true
+  }
 
-  await collection.createSearchIndex({
-    name: PDF_VECTOR_INDEX_NAME,
-    type: "vectorSearch",
-    definition: {
-      fields: [
-        {
-          type: "vector",
-          path: "embedding",
-          numDimensions: EMBEDDING_DIMENSIONS,
-          similarity: "cosine",
+  if (!existingNames.has(PDF_TEXT_INDEX_NAME)) {
+    await collection.createSearchIndex({
+      name: PDF_TEXT_INDEX_NAME,
+      definition: {
+        mappings: {
+          dynamic: false,
+          fields: {
+            text: { type: "string" },
+            file_name: { type: "string" },
+            document_id: { type: "token" },
+          },
         },
-        {
-          type: "filter",
-          path: "document_id",
-        },
-      ],
-    },
-  })
+      },
+    })
+    created = true
+  }
 
-  return true
+  return created
 }
 
 export async function waitForPdfIndex(
@@ -269,6 +296,79 @@ export async function waitForPdfIndex(
   return false
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function searchPdfTextChunks(
+  client: MongoClient,
+  query: string,
+  documentId: string | undefined,
+  limit: number
+): Promise<PdfSearchCandidate[]> {
+  const collection = client.db(DATABASE_NAME).collection(PDF_COLLECTION_NAME)
+  const compound: Record<string, unknown> = {
+    must: [{ text: { query, path: "text" } }],
+  }
+
+  if (documentId) {
+    compound.filter = [{ equals: { path: "document_id", value: documentId } }]
+  }
+
+  try {
+    return await collection.aggregate<PdfSearchCandidate>([
+      {
+        $search: {
+          index: PDF_TEXT_INDEX_NAME,
+          compound,
+        },
+      },
+      { $limit: limit },
+      {
+        $project: {
+          _id: 0,
+          document_id: 1,
+          file_name: 1,
+          page_number: 1,
+          chunk_index: 1,
+          text: 1,
+          text_score: { $meta: "searchScore" },
+        },
+      },
+    ]).toArray()
+  } catch (error: any) {
+    console.warn(`Atlas PDF text search unavailable; using regex fallback: ${error.message}`)
+  }
+
+  const documentFilter = documentId ? { document_id: documentId } : {}
+  let results = await collection.find<PdfSearchCandidate>({
+    ...documentFilter,
+    text: { $regex: escapeRegex(query), $options: "i" },
+  }, {
+    projection: { _id: 0, embedding: 0, created_at: 0 },
+  }).limit(limit).toArray()
+
+  if (results.length === 0) {
+    const tokens = query.toLowerCase().match(/[a-z0-9]+/g)
+      ?.filter((token) => token.length > 2)
+      .filter((token, index, all) => all.indexOf(token) === index)
+      ?? []
+
+    if (tokens.length > 0) {
+      results = await collection.find<PdfSearchCandidate>({
+        ...documentFilter,
+        $or: tokens.map((token) => ({
+          text: { $regex: escapeRegex(token), $options: "i" },
+        })),
+      }, {
+        projection: { _id: 0, embedding: 0, created_at: 0 },
+      }).limit(limit).toArray()
+    }
+  }
+
+  return results
+}
+
 export async function searchPdfChunks(
   client: MongoClient,
   query: string,
@@ -278,34 +378,66 @@ export async function searchPdfChunks(
   if (!trimmedQuery) throw new Error("PDF search query cannot be empty")
 
   const limit = Math.min(Math.max(options.limit ?? 5, 1), 20)
-  const embeddings = new GeminiEmbeddings()
-  const queryVector = await retry(() => embeddings.embedQuery(trimmedQuery))
-  const vectorSearch: Record<string, unknown> = {
-    index: PDF_VECTOR_INDEX_NAME,
-    path: "embedding",
-    queryVector,
-    numCandidates: Math.max(100, limit * 20),
-    limit,
-  }
+  const candidateLimit = Math.min(Math.max(limit * 4, 20), 100)
+  const collection = client.db(DATABASE_NAME).collection(PDF_COLLECTION_NAME)
 
-  if (options.documentId) {
-    vectorSearch.filter = { document_id: options.documentId }
-  }
+  const vectorPromise = (async (): Promise<PdfSearchCandidate[]> => {
+    const queryVector = await retry(() => new GeminiEmbeddings().embedQuery(trimmedQuery))
+    const vectorSearch: Record<string, unknown> = {
+      index: PDF_VECTOR_INDEX_NAME,
+      path: "embedding",
+      queryVector,
+      numCandidates: Math.max(100, candidateLimit * 10),
+      limit: candidateLimit,
+    }
 
-  return client.db(DATABASE_NAME).collection(PDF_COLLECTION_NAME).aggregate<PdfSearchResult>([
-    { $vectorSearch: vectorSearch },
-    {
-      $project: {
-        _id: 0,
-        document_id: 1,
-        file_name: 1,
-        page_number: 1,
-        chunk_index: 1,
-        text: 1,
-        score: { $meta: "vectorSearchScore" },
+    if (options.documentId) {
+      vectorSearch.filter = { document_id: options.documentId }
+    }
+
+    return collection.aggregate<PdfSearchCandidate>([
+      { $vectorSearch: vectorSearch },
+      {
+        $project: {
+          _id: 0,
+          document_id: 1,
+          file_name: 1,
+          page_number: 1,
+          chunk_index: 1,
+          text: 1,
+          vector_score: { $meta: "vectorSearchScore" },
+        },
       },
-    },
-  ]).toArray()
+    ]).toArray()
+  })().catch((error: any) => {
+    console.warn(`PDF vector search unavailable: ${error.message}`)
+    return [] as PdfSearchCandidate[]
+  })
+
+  const textPromise = searchPdfTextChunks(
+    client,
+    trimmedQuery,
+    options.documentId,
+    candidateLimit
+  )
+
+  const [vectorResults, textResults] = await Promise.all([vectorPromise, textPromise])
+  const toRanked = (
+    results: PdfSearchCandidate[],
+    scoreField: "vector_score" | "text_score"
+  ): RankedSearchResult<PdfSearchCandidate>[] => results.map((document) => ({
+    id: `${document.document_id}:${document.chunk_index}`,
+    document,
+    score: document[scoreField],
+  }))
+
+  return reciprocalRankFusion([
+    { name: "vector", results: toRanked(vectorResults, "vector_score") },
+    { name: "text", results: toRanked(textResults, "text_score") },
+  ], limit).map(({ document, ...ranking }) => ({
+    ...document,
+    ...ranking,
+  }))
 }
 
 export async function ingestPdf(
@@ -387,7 +519,7 @@ export async function ingestPdf(
     : []
 
   if (indexReady && searchResults.length === 0) {
-    throw new Error("PDF chunks were stored, but semantic retrieval returned no results")
+    throw new Error("PDF chunks were stored, but hybrid retrieval returned no results")
   }
 
   return {

@@ -6,6 +6,8 @@ import express, { Express, Request, Response } from "express"
 import { MongoClient } from "mongodb"
 // Import our custom AI agent function
 import { callAgent } from './agent'
+import { ensureInventorySearchIndexes } from './inventory-search'
+import { ensurePdfIndexes } from './pdf-rag'
 
 // Create Express application instance
 const app: Express = express()
@@ -28,6 +30,20 @@ async function startServer() {
     await client.db("admin").command({ ping: 1 })
     // Log successful connection
     console.log("You successfully connected to MongoDB!")
+
+    // Ensure both vector and full-text indexes exist. Atlas builds new search
+    // indexes asynchronously; retrieval uses a regex lexical fallback while a
+    // text index is still becoming queryable.
+    await Promise.all([
+      ensureInventorySearchIndexes(client).catch((error: any) => {
+        console.warn("Unable to ensure inventory search indexes:", error.message)
+        return false
+      }),
+      ensurePdfIndexes(client).catch((error: any) => {
+        console.warn("Unable to ensure PDF search indexes:", error.message)
+        return false
+      }),
+    ])
 
     // Define root endpoint (GET /) - simple health check
     app.get('/', (req: Request, res: Response) => {

@@ -11,6 +11,7 @@ import { z } from "zod"
 // Load environment variables from .env file (API keys, connection strings)
 import "dotenv/config"
 import { GeminiEmbeddings } from "./gemini-embeddings"
+import { ensureInventorySearchIndexes } from "./inventory-search"
 
 // Create MongoDB client instance using connection string from environment variables
 const client = new MongoClient(process.env.MONGODB_ATLAS_URI as string)
@@ -80,35 +81,6 @@ async function setupDatabaseAndCollection(): Promise<void> {
   }
 }
 
-// Function to create vector search index
-async function createVectorSearchIndex(): Promise<void> {
-  try {
-    const db = client.db("inventory_database")
-    const collection = db.collection("items")
-    await collection.dropIndexes()
-    const vectorSearchIdx = {
-      name: "vector_index",
-      type: "vectorSearch",
-      definition: {
-        "fields": [
-          {
-            "type": "vector",
-            "path": "embedding",
-            "numDimensions": 768,
-            "similarity": "cosine"
-          }
-        ]
-      }
-    }
-    console.log("Creating vector search index...")
-    await collection.createSearchIndex(vectorSearchIdx);
-
-    console.log("Successfully created vector search index");
-  } catch (e) {
-    console.error('Failed to create vector search index:', e);
-  }
-}
-
 async function generateSyntheticData(): Promise<Item[]> {
   // Create detailed prompt instructing AI to generate furniture store data
   const prompt = `You are a helpful assistant that generates furniture store item data. Generate 10 furniture store items. Each record should include the following fields: item_id, item_name, item_description, brand, manufacturer_address, prices, categories, user_reviews, notes. Ensure variety in the data and realistic values.
@@ -167,8 +139,9 @@ async function seedDatabase(): Promise<void> {
     // Setup database and collection
     await setupDatabaseAndCollection()
     
-    // Create vector search index
-    await createVectorSearchIndex()
+    // Create the vector and lexical indexes used by hybrid search.
+    const indexesCreated = await ensureInventorySearchIndexes(client)
+    console.log(indexesCreated ? "Created inventory search indexes" : "Inventory search indexes already exist")
 
     // Get reference to specific database
     const db = client.db("inventory_database")
