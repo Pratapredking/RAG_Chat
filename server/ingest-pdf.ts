@@ -1,6 +1,7 @@
 import "dotenv/config"
 import { MongoClient } from "mongodb"
 import { ingestPdf } from "./pdf-rag"
+import dns from "node:dns"
 
 function getOption(args: string[], name: string): string | undefined {
   const index = args.indexOf(name)
@@ -27,6 +28,9 @@ async function main(): Promise<void> {
   if (!process.env.GOOGLE_API_KEY) {
     throw new Error("GOOGLE_API_KEY is required")
   }
+  
+  dns.setServers(["1.1.1.1", "1.0.0.1"]);
+  
 
   const client = new MongoClient(mongoUri)
 

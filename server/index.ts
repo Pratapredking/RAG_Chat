@@ -8,6 +8,8 @@ import { MongoClient } from "mongodb"
 import { callAgent } from './agent'
 import { ensureInventorySearchIndexes } from './inventory-search'
 import { ensurePdfIndexes } from './pdf-rag'
+import dns from "node:dns"
+
 
 // Create Express application instance
 const app: Express = express()
@@ -18,6 +20,7 @@ app.use(cors())
 // Enable JSON parsing for incoming requests (req.body will contain parsed JSON)
 app.use(express.json())
 
+dns.setServers(["1.1.1.1", "1.0.0.1"]);
 // Create MongoDB client using connection string from environment variables
 const client = new MongoClient(process.env.MONGODB_ATLAS_URI as string)
 

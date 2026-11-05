@@ -314,6 +314,16 @@ This project is licensed under the MIT License.
 
 ---
 
+## Find public IP for local system
+
+Run this on your Windows PC:
+
+</> powershell 
+
+Invoke-RestMethod https://api.ipify.org
+
+---
+
 <div align="center">
 
 **Built with ❤️ by Ania Kubow**
